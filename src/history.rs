@@ -160,12 +160,13 @@ impl HistoryEntry {
                 .sum::<usize>()
     }
 
-    fn matches(&self, needle: &str) -> bool {
-        let matches_field = |field: &str| field.to_lowercase().contains(needle);
-        matches_field(&self.raw_text)
+    fn matches(&self, needle: &str, buffer: &mut String) -> bool {
+        let mut matches_field = |field: &str| contains_lowercased(field, needle, buffer);
+        // The raw text is usually the final text: search it once.
+        (self.raw_text != self.final_text && matches_field(&self.raw_text))
             || matches_field(&self.final_text)
-            || self.application.as_deref().is_some_and(matches_field)
-            || self.model.as_deref().is_some_and(matches_field)
+            || self.application.as_deref().is_some_and(&mut matches_field)
+            || self.model.as_deref().is_some_and(&mut matches_field)
             || self
                 .processing
                 .as_ref()
@@ -495,13 +496,14 @@ impl HistoryStore {
     /// processing profile. Newest first and bounded.
     pub fn search(&self, query: &str, now_ms: u64) -> Vec<&HistoryEntry> {
         let needle = query.trim().to_lowercase();
+        let mut buffer = String::new();
         let cutoff = self
             .retention
             .max_age_ms()
             .map(|max_age| now_ms.saturating_sub(max_age));
         self.entries()
             .filter(|entry| cutoff.is_none_or(|cutoff| entry.timestamp_ms >= cutoff))
-            .filter(|entry| needle.is_empty() || entry.matches(&needle))
+            .filter(|entry| needle.is_empty() || entry.matches(&needle, &mut buffer))
             .take(MAX_SEARCH_RESULTS)
             .collect()
     }
@@ -732,6 +734,20 @@ impl History {
 }
 
 pub use crate::desktop::events::now_ms;
+
+/// Whether `haystack.to_lowercase()` contains `needle`, which is lowercase.
+/// History search runs this over every entry for each key typed, so an
+/// ASCII haystack, as most dictations are, is lowercased into `buffer`, one
+/// allocation a search, rather than into a new string a field.
+fn contains_lowercased(haystack: &str, needle: &str, buffer: &mut String) -> bool {
+    if !haystack.is_ascii() {
+        return haystack.to_lowercase().contains(needle);
+    }
+    buffer.clear();
+    buffer.push_str(haystack);
+    buffer.make_ascii_lowercase();
+    buffer.contains(needle)
+}
 
 fn truncated(text: &str, max_bytes: usize) -> String {
     text[..text.floor_char_boundary(max_bytes)].to_string()
@@ -1257,6 +1273,52 @@ mod tests {
             store.entries[0].id > 0,
             "byte pressure also evicts oldest first"
         );
+    }
+
+    #[test]
+    fn lowercasing_into_a_buffer_matches_lowercasing_a_copy() {
+        let haystacks = [
+            "Deploy the Cache Key",
+            "deploy",
+            "",
+            "Ünïcode Straße",
+            "\u{212A}elvin",
+            "İstanbul",
+            "ÀB",
+        ];
+        let needles = [
+            "",
+            "d",
+            "cache key",
+            "key ",
+            "y",
+            "ünï",
+            "straße",
+            "k",
+            "kelvin",
+            "i̇",
+            "à",
+            "b",
+            "zzz",
+        ];
+        for haystack in haystacks {
+            for needle in needles {
+                assert_eq!(
+                    contains_lowercased(haystack, needle, &mut String::new()),
+                    haystack.to_lowercase().contains(needle),
+                    "{haystack:?} for {needle:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn search_finds_the_raw_text_when_processing_changed_it() {
+        let path = temp_path("search-raw");
+        let mut store = HistoryStore::open(path, HistoryRetention::Week, 0);
+        store.record(draft("Final words"), 1_000).unwrap();
+        assert_eq!(store.search("raw final", 1_000).len(), 1);
+        assert_eq!(store.search("final words", 1_000).len(), 1);
     }
 
     #[test]
