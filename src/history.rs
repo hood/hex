@@ -257,6 +257,9 @@ pub struct HistoryStore {
     /// listener and the History pane in separate processes, so each store
     /// rereads the file when another process changed it.
     file_state: Option<(SystemTime, u64)>,
+    /// Moves on whenever what a search could return may have changed, so a
+    /// reader can skip searching again ([`History::revision`]).
+    revision: u64,
 }
 
 fn file_state(path: &std::path::Path) -> Option<(SystemTime, u64)> {
@@ -279,6 +282,7 @@ impl HistoryStore {
             prune_pending: false,
             prune_error_reported: false,
             file_state: None,
+            revision: 0,
         };
         store.file_state = file_state(&store.path);
         match fs::read(&store.path) {
@@ -339,6 +343,7 @@ impl HistoryStore {
             .max(max_entry_id.map_or(1, |id| id.saturating_add(1)));
         self.entries = loaded.entries;
         self.entries.sort_by_key(|entry| entry.id);
+        self.revision += 1;
     }
 
     /// Record one successful result. Returns the stable entry ID, or `None`
@@ -470,6 +475,7 @@ impl HistoryStore {
             return Ok(());
         }
         self.retention = retention;
+        self.revision += 1;
         if self.prune(now_ms) {
             self.persist()?;
         }
@@ -504,6 +510,22 @@ impl HistoryStore {
             .filter(|entry| needle.is_empty() || entry.matches(&needle))
             .take(MAX_SEARCH_RESULTS)
             .collect()
+    }
+
+    /// See [`History::revision`]. An entry that outlived retention since the
+    /// last prune is pruned now, in memory (the idle worker saves it), so a
+    /// reader that skips searching still loses it as a search would.
+    pub fn revision(&mut self, now_ms: u64) -> u64 {
+        let cutoff = self
+            .retention
+            .max_age_ms()
+            .map(|max_age| now_ms.saturating_sub(max_age));
+        if let (Some(cutoff), Some(oldest)) = (cutoff, self.entries.first())
+            && oldest.timestamp_ms < cutoff
+        {
+            self.prune(now_ms);
+        }
+        self.revision
     }
 
     /// The newest `count` entries within retention that a paste could
@@ -577,10 +599,14 @@ impl HistoryStore {
             }
         }
         self.prune_pending |= changed;
+        self.revision += u64::from(changed);
         changed
     }
 
+    /// Saves the entries. Every change in memory comes through here, even
+    /// one a failed save then puts back, so it moves the revision on.
     fn persist(&mut self) -> io::Result<()> {
+        self.revision += 1;
         let saved = SavedHistory {
             version: VERSION,
             next_id: self.next_id,
@@ -693,6 +719,13 @@ impl History {
 
     pub fn set_retention(&self, retention: HistoryRetention) -> io::Result<()> {
         self.synced().set_retention(retention, now_ms())
+    }
+
+    /// Moves on whenever a [`Self::search`] might answer differently: a
+    /// record, deletion, change, prune, retention choice, or another
+    /// process's write. The window searches again only when it moved.
+    pub fn revision(&self) -> u64 {
+        self.synced().revision(now_ms())
     }
 
     /// Bounded snapshot of matching entries, newest first.
@@ -1040,6 +1073,42 @@ mod tests {
             .map(|entry| entry.final_text.as_str())
             .collect();
         assert_eq!(texts, ["newest"]);
+    }
+
+    #[test]
+    fn the_revision_moves_only_when_a_search_could_answer_differently() {
+        let path = temp_path("revision");
+        let day_ms = HistoryRetention::Day.max_age_ms().unwrap();
+        let mut window = HistoryStore::open(path.clone(), HistoryRetention::Day, 0);
+        let mut listener = HistoryStore::open(path.clone(), HistoryRetention::Day, 0);
+        let start = window.revision(0);
+        let first = window.record(draft("first"), 1_000).unwrap().unwrap();
+        let recorded = window.revision(1_000);
+        assert_ne!(recorded, start);
+        assert_eq!(window.search("first", 1_000).len(), 1);
+        assert_eq!(window.revision(1_000), recorded, "a search changes nothing");
+
+        // Another process's write, once this store rereads it.
+        listener.sync();
+        listener.record(draft("second"), 2_000).unwrap();
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(UNIX_EPOCH)
+            .unwrap();
+        window.sync();
+        let synced = window.revision(2_000);
+        assert_ne!(synced, recorded);
+
+        // The first entry outlives retention before the idle prune.
+        let expired = window.revision(day_ms + 1_001);
+        assert_ne!(expired, synced);
+        assert!(window.entry(first).is_none());
+        assert_eq!(window.revision(day_ms + 1_002), expired);
+
+        window.delete(first + 1).unwrap();
+        assert_ne!(window.revision(day_ms + 1_002), expired);
     }
 
     #[test]
