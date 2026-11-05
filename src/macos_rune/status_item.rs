@@ -42,7 +42,22 @@ pub enum StatusItemAction {
 
 #[derive(Debug)]
 struct StatusItemTargetIvars {
-    actions: SyncSender<StatusItemAction>,
+    actions: Actions,
+}
+
+/// The menu's actions for the main-thread pump, which each one wakes.
+#[derive(Debug)]
+struct Actions(SyncSender<StatusItemAction>);
+
+impl Actions {
+    fn try_send(
+        &self,
+        action: StatusItemAction,
+    ) -> Result<(), std::sync::mpsc::TrySendError<StatusItemAction>> {
+        self.0.try_send(action)?;
+        crate::macos_rune::wake_pump();
+        Ok(())
+    }
 }
 
 objc2::define_class!(
@@ -153,7 +168,9 @@ objc2::define_class!(
 
 impl StatusItemTarget {
     fn new(actions: SyncSender<StatusItemAction>, mtm: MainThreadMarker) -> Retained<Self> {
-        let this = Self::alloc(mtm).set_ivars(StatusItemTargetIvars { actions });
+        let this = Self::alloc(mtm).set_ivars(StatusItemTargetIvars {
+            actions: Actions(actions),
+        });
         unsafe { msg_send![super(this), init] }
     }
 }

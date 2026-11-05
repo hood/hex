@@ -97,11 +97,20 @@ mod macos {
     use super::DictationIndicatorEvent;
 
     #[derive(Clone)]
-    pub struct DictationIndicatorSender(Sender<DictationIndicatorEvent>);
+    pub struct DictationIndicatorSender {
+        sender: Sender<DictationIndicatorEvent>,
+        /// Tells the pump there's something to drain. Meter readings don't
+        /// wake it: only a HUD that animates shows them, and the pump ticks
+        /// every frame while it does.
+        wake: fn(),
+    }
 
     impl DictationIndicatorSender {
         pub fn send(&self, event: DictationIndicatorEvent) {
-            let _ = self.0.send(event);
+            let meter = matches!(event, DictationIndicatorEvent::Meter { .. });
+            if self.sender.send(event).is_ok() && !meter {
+                (self.wake)();
+            }
         }
 
         pub fn meter(&self, samples: &[f32]) {
@@ -111,9 +120,17 @@ mod macos {
         }
     }
 
-    pub fn channel() -> (DictationIndicatorSender, Receiver<DictationIndicatorEvent>) {
+    #[cfg(test)]
+    fn channel() -> (DictationIndicatorSender, Receiver<DictationIndicatorEvent>) {
+        waking_channel(|| {})
+    }
+
+    /// A channel whose every send but a meter reading also calls `wake`.
+    pub fn waking_channel(
+        wake: fn(),
+    ) -> (DictationIndicatorSender, Receiver<DictationIndicatorEvent>) {
         let (sender, receiver) = mpsc::channel();
-        (DictationIndicatorSender(sender), receiver)
+        (DictationIndicatorSender { sender, wake }, receiver)
     }
 
     #[cfg(test)]
@@ -129,6 +146,22 @@ mod macos {
             };
             assert!((average - 0.5).abs() < f32::EPSILON);
             assert!((peak - 0.5).abs() < f32::EPSILON);
+        }
+
+        #[test]
+        fn every_event_but_a_meter_reading_wakes_the_pump() {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            static WAKES: AtomicUsize = AtomicUsize::new(0);
+            let (sender, receiver) = waking_channel(|| {
+                WAKES.fetch_add(1, Ordering::Relaxed);
+            });
+            sender.meter(&[0.5]);
+            assert_eq!(WAKES.load(Ordering::Relaxed), 0);
+            sender.send(DictationIndicatorEvent::Started);
+            assert_eq!(WAKES.load(Ordering::Relaxed), 1);
+            drop(receiver);
+            sender.send(DictationIndicatorEvent::Reset);
+            assert_eq!(WAKES.load(Ordering::Relaxed), 1, "nobody left to drain it");
         }
     }
 }

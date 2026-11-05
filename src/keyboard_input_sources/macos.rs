@@ -245,5 +245,6 @@ unsafe extern "C" fn changed(_: Ref, observer: *mut c_void, _: Ref, _: Ref, _: R
     if let Some(changes) = unsafe { observer.cast::<Changes>().as_ref() } {
         changes.layout.store(true, Ordering::Release);
         changes.source.store(true, Ordering::Release);
+        crate::macos_rune::wake_pump();
     }
 }

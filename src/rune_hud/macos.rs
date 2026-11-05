@@ -103,6 +103,11 @@ impl DictationIndicatorUi {
         self.hud.send(event);
     }
 
+    /// Whether the HUD is drawing frames, so the pump follows the pointer.
+    pub(crate) fn animating(&self) -> bool {
+        self.hud.animating.load(Ordering::Acquire)
+    }
+
     /// Keeps a showing HUD on the pointer's screen, and hides it when the
     /// indicator is set to Hidden.
     pub(crate) fn follow_pointer(&mut self) {

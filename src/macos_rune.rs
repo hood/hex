@@ -61,17 +61,20 @@ mod control;
 mod launch;
 mod main_menu;
 pub(crate) mod status_item;
+mod wake;
 
 use activation::{observe_activation, reopen_on_activation};
 use launch::{LaunchWindow, launched_as_login_item, observe_launch, take_login_launch_activation};
 use main_menu::install_main_menu;
+pub(crate) use wake::wake_pump;
+use wake::{pace_pump, turn_started};
 
 #[cfg(test)]
 mod tests;
 
 /// How often the runtime refreshes while nothing is asked.
 const RUNTIME_TICK: Duration = Duration::from_millis(250);
-/// The main-loop timer: the HUD follows the pointer and channels drain.
+/// The main-loop timer while the HUD animates: it follows the pointer.
 const PUMP_INTERVAL: f64 = 0.016;
 /// Seconds a window opened at launch has to draw its first frame before the
 /// status item, HUD, and menu are set up anyway.
@@ -364,7 +367,7 @@ pub fn run(shutdown: &'static AtomicBool, listener: ListenerConfig) -> Result<()
     let (controller_events_sender, controller_events) = mpsc::sync_channel(32);
     let (controller_commands, controller_command_receiver) = mpsc::sync_channel(8);
     let (meeting_requests, meeting_request_receiver) = mpsc::sync_channel(8);
-    let (indicator, indicator_events) = crate::dictation::indicator::channel();
+    let (indicator, indicator_events) = crate::dictation::indicator::waking_channel(wake_pump);
 
     // The controller idles without inspecting microphone activity until the
     // user opts in to meetings (always available in developer builds).
@@ -536,10 +539,11 @@ pub fn run(shutdown: &'static AtomicBool, listener: ListenerConfig) -> Result<()
         .name("hex-control".into())
         .spawn(move || {
             for call in control_receiver {
-                if let Some(call) = control::answer_off_main(&control_runtime, call)
-                    && pump_calls.send(call).is_err()
-                {
-                    return;
+                if let Some(call) = control::answer_off_main(&control_runtime, call) {
+                    if pump_calls.send(call).is_err() {
+                        return;
+                    }
+                    wake_pump();
                 }
             }
         })?;
@@ -986,7 +990,8 @@ fn start_main_thread() {
                         let _ = state.pump.runtime.send(Request::InputSourceChanged(source));
                     }
                 }
-                state.pump.tick(&mut state.indicator);
+                let animating = state.pump.tick(&mut state.indicator);
+                pace_pump(&state.timer, animating);
             }
         });
     });
@@ -1059,11 +1064,14 @@ fn bring_forward(window: &rune::AppHandle<Ui>) {
 }
 
 impl Pump {
-    fn tick(&mut self, indicator: &mut DictationIndicatorUi) {
+    /// One turn of the main loop; returns whether the HUD animates, so the
+    /// next turn comes a frame on.
+    fn tick(&mut self, indicator: &mut DictationIndicatorUi) -> bool {
+        turn_started();
         if self.shutdown.load(Ordering::Relaxed) {
             self.runtime_cancel();
             self.window.quit();
-            return;
+            return false;
         }
         // Restart to update swapped in the new version after its final check.
         match UPDATER
@@ -1072,17 +1080,22 @@ impl Pump {
         {
             Some(Ok(())) => {
                 self.window.quit();
-                return;
+                return false;
             }
             Some(Err(error)) => {
                 tracing::warn!(error = %format!("{error:#}"), "could not restart into the update");
             }
             None => {}
         }
+        // The HUD marks itself animating once it takes the event, after this
+        // turn, so the turn after an event comes a frame on too.
+        let mut animating = false;
         while let Ok(event) = self.indicator_events.try_recv() {
             indicator.handle(event);
+            animating = true;
         }
         indicator.follow_pointer();
+        animating |= indicator.animating();
         while let Ok(call) = self.developer_calls.try_recv() {
             let reply = self.developer(call.command, indicator);
             let _ = call.reply.send(reply);
@@ -1110,7 +1123,7 @@ impl Pump {
             crate::macos_rune::status_item::update_overlays_in_recordings(shown);
         }
         if self.status_actions.is_none() {
-            return;
+            return animating;
         }
         let now = Instant::now();
         if now >= self.model_menu_at {
@@ -1130,6 +1143,7 @@ impl Pump {
             crate::macos_rune::status_item::update_software(&update_status());
             self.meeting_menu_at = now + MEETING_MENU_REFRESH;
         }
+        animating
     }
 
     fn runtime_cancel(&self) {
